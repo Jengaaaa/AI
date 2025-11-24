@@ -23,8 +23,14 @@ class AVEC2017AudioTextDataset(Dataset):
         self.data = []
         with open(split_file, "r") as f:
             lines = f.readlines()[1:]  # skip header
+
         for line in lines:
             subject, label = line.strip().split(",")
+
+            # subject = '300' -> '300_P'
+            if not subject.endswith("_P"):
+                subject = subject + "_P"
+
             self.data.append((subject, float(label)))
 
     def __len__(self):
@@ -39,11 +45,10 @@ class AVEC2017AudioTextDataset(Dataset):
             audio, sr = librosa.load(seg_path, sr=16000)
             audio_tensors.append(torch.tensor(audio, dtype=torch.float32))
 
-        # Pad audio to same length per segment
         max_len = max([a.shape[0] for a in audio_tensors])
         padded = [torch.nn.functional.pad(a, (0, max_len - len(a))) for a in audio_tensors]
 
-        return torch.stack(padded)   # (num_segments, audio_len)
+        return torch.stack(padded)   # (S, audio_len)
 
     def load_text_segments(self, subject_id):
         seg_dir = f"{self.root}/segments_text/{subject_id}"
@@ -52,7 +57,6 @@ class AVEC2017AudioTextDataset(Dataset):
         for i in range(self.num_segments):
             seg_path = f"{seg_dir}/seg_{i:03d}.txt"
 
-            # Load segment text lines
             if os.path.exists(seg_path):
                 with open(seg_path, "r") as f:
                     text = " ".join([l.strip() for l in f.readlines()])
@@ -69,7 +73,7 @@ class AVEC2017AudioTextDataset(Dataset):
 
             text_tensors.append(encoded["input_ids"].squeeze(0))
 
-        return torch.stack(text_tensors)  # (num_segments, max_text_len)
+        return torch.stack(text_tensors)
 
     def __getitem__(self, idx):
         subject_id, label = self.data[idx]
@@ -78,7 +82,7 @@ class AVEC2017AudioTextDataset(Dataset):
         text = self.load_text_segments(subject_id)
 
         return {
-            "audio": audio,           # (50, audio_len)
-            "text": text,             # (50, max_text_len)
+            "audio": audio,
+            "text": text,
             "label": torch.tensor(label, dtype=torch.float32)
         }

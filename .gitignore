@@ -36,6 +36,7 @@ __pycache__/
 ##########################################
 .venv/
 venv/
+venv310/
 env/
 ENV/
 conda-env/
