@@ -3,111 +3,114 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================
-# 1D Residual Block
-# ============================================
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    """
+    1D Conv Residual Block
+    입력: (B, C, T)
+    출력: (B, C_out, T)  (stride=1, padding=same이라 T 유지)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
         self.bn1 = nn.BatchNorm1d(out_channels)
 
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding)
         self.bn2 = nn.BatchNorm1d(out_channels)
 
-        # If in/out channel mismatch → projection needed
-        self.proj = nn.Conv1d(in_channels, out_channels, kernel_size=1) \
-                    if in_channels != out_channels else None
+        self.proj = None
+        if in_channels != out_channels:
+            self.proj = nn.Conv1d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
         identity = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
 
         if self.proj is not None:
             identity = self.proj(identity)
 
-        out += identity
-        return F.relu(out)
+        out = out + identity
+        out = F.relu(out)
+        return out
 
 
-# ============================================
-# Attention Layer (for feature weighting)
-# ============================================
-class AttentionLayer(nn.Module):
+class TemporalAttention(nn.Module):
+    """
+    시계열 차원(T)에 대해 attention pooling 수행
+    입력: (B, T, D)
+    출력: (B, D)
+    """
     def __init__(self, dim):
         super().__init__()
         self.W = nn.Linear(dim, dim)
         self.u = nn.Linear(dim, 1)
 
-    def forward(self, x):   # x: (batch, time, dim)
-        u_t = torch.tanh(self.W(x))
-        att = self.u(u_t)     # (batch, time, 1)
-        att = F.softmax(att, dim=1)
-
-        out = (x * att).sum(dim=1)   # weighted sum → (batch, dim)
+    def forward(self, x):
+        # x: (B, T, D)
+        u_t = torch.tanh(self.W(x))      # (B, T, D)
+        att = self.u(u_t)                # (B, T, 1)
+        att = torch.softmax(att, dim=1)  # (B, T, 1)
+        out = (x * att).sum(dim=1)       # (B, D)
         return out
 
 
-# ============================================
-# Encoder-Decoder BiLSTM
-# ============================================
-class EncoderDecoderBLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim=512):
-        super().__init__()
-        self.encoder1 = nn.LSTM(input_dim, 1024, bidirectional=True, batch_first=True)
-        self.encoder2 = nn.LSTM(2048, 1024, bidirectional=True, batch_first=True)
-        self.encoder3 = nn.LSTM(2048, 512, bidirectional=True, batch_first=True)
-
-        self.att = AttentionLayer(1024)
-
-        self.decoder = nn.LSTM(1024, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, 512)
-
-    def forward(self, x):
-        # x: (batch, time, feat)
-        x, _ = self.encoder1(x)
-        x, _ = self.encoder2(x)
-        x, _ = self.encoder3(x)
-
-        x = self.att(x).unsqueeze(1)  # (batch, 1, 1024)
-
-        x, _ = self.decoder(x)
-        x = self.fc(x[:, -1, :])      # final output
-        return x  # (batch, 512)
-
-
-# ============================================
-# Full Audio Encoder Model
-# ============================================
 class AudioEncoder(nn.Module):
-    def __init__(self, input_sr=16000):
+    """
+    Raw waveform(16kHz) segment 하나를 인코딩해서 512차원 벡터로 변환
+    입력:  x: (B, L_a)
+    출력:  (B, feat_dim=512)
+    """
+    def __init__(self, feat_dim: int = 512):
         super().__init__()
+        self.feat_dim = feat_dim
 
-        # 1D CNN Spatial Feature Extractor
-        self.res1 = ResidualBlock1D(1, 64)
-        self.res2 = ResidualBlock1D(64, 128)
-        self.res3 = ResidualBlock1D(128, 256)
-        self.res4 = ResidualBlock1D(256, 512)
+        # 1D CNN (Residual Blocks)
+        self.block1 = ResidualBlock1D(1, 64)
+        self.block2 = ResidualBlock1D(64, 128)
+        self.block3 = ResidualBlock1D(128, 256)
+        self.block4 = ResidualBlock1D(256, 512)
 
-        # Final temporal dimension flatten
-        self.att = AttentionLayer(512)
+        # Conv 뒤에 BiLSTM
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )  # 출력: (B, T, 512)
 
-        self.encdec = EncoderDecoderBLSTM(512)
-    
+        # 시간축 Attention + FC -> 512
+        self.att = TemporalAttention(512)
+        self.fc = nn.Linear(512, feat_dim)
+
     def forward(self, x):
-        # x shape: (batch, audio_len)
-        x = x.unsqueeze(1)  # (batch, 1, len)
+        """
+        x: (B, L_a)
+        """
+        # (B, 1, T)
+        x = x.unsqueeze(1)
 
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
-        x = self.res4(x)
+        # CNN feature 추출
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)  # (B, 512, T)
 
-        # CNN output → (B, C, T) → transpose for LSTM
-        x = x.transpose(1, 2)  # (batch, time, 512)
+        # LSTM 입력을 위해 (B, T, C)
+        x = x.transpose(1, 2)  # (B, T, 512)
 
-        x = self.att(x).unsqueeze(1)
-        x = self.encdec(x)      # (batch, 512)
+        x, _ = self.lstm(x)    # (B, T, 512)
 
+        # Attention pooling
+        x = self.att(x)        # (B, 512)
+
+        # 최종 투영
+        x = self.fc(x)         # (B, feat_dim)
         return x

@@ -6,19 +6,31 @@ from transformers import AutoModel
 
 class AttentionLayer(nn.Module):
     """
-    시퀀스(hidden states)에 대해 가중합을 구하는 단순 Attention 레이어!
-    x: (batch, time, dim) -> (batch, dim)
+    시퀀스(hidden states)에 대해 가중합을 구하는 Attention 레이어
+    입력: (B, T, D)
+    출력: (B, D)
     """
     def __init__(self, dim):
         super().__init__()
         self.W = nn.Linear(dim, dim)
         self.u = nn.Linear(dim, 1)
 
-    def forward(self, x):  # x: (B, T, D)
-        u_t = torch.tanh(self.W(x))     # (B, T, D)
-        att = self.u(u_t)               # (B, T, 1)
-        att = F.softmax(att, dim=1)     # (B, T, 1)
-        out = (x * att).sum(dim=1)      # (B, D)
+    def forward(self, x, mask=None):
+        """
+        x: (B, T, D)
+        mask: (B, T)  (1 = 유효 토큰, 0 = 패딩) 또는 None
+        """
+        u_t = torch.tanh(self.W(x))      # (B, T, D)
+        att = self.u(u_t).squeeze(-1)    # (B, T)
+
+        if mask is not None:
+            # 패딩 위치에 -inf 가중치 적용
+            att = att.masked_fill(mask == 0, float('-inf'))
+
+        att = torch.softmax(att, dim=1)  # (B, T)
+        att = att.unsqueeze(-1)          # (B, T, 1)
+
+        out = (x * att).sum(dim=1)       # (B, D)
         return out
 
 
@@ -43,7 +55,7 @@ class TextEncoder(nn.Module):
         hidden_size = self.bert.config.hidden_size
         self.use_lstm = use_lstm
 
-        # 2) BiLSTM 추가 (선택)
+        # 2) BiLSTM (선택)
         if use_lstm:
             self.lstm = nn.LSTM(
                 input_size=hidden_size,
@@ -65,8 +77,17 @@ class TextEncoder(nn.Module):
         """
         input_ids: (B, L)
         attention_mask: (B, L) or None
-        return: (B, out_dim=512)
+        return: (B, out_dim)
         """
+
+        # attention_mask가 전부 0인 경우(빈 세그먼트) 방지
+        if attention_mask is not None:
+            # 배치별로 모두 0인 경우 1로 바꿔줌
+            mask_sum = attention_mask.sum(dim=1)
+            all_zero = (mask_sum == 0)
+            if all_zero.any():
+                attention_mask = attention_mask.clone()
+                attention_mask[all_zero] = 1
 
         bert_out = self.bert(
             input_ids=input_ids,
@@ -77,10 +98,9 @@ class TextEncoder(nn.Module):
         if self.use_lstm:
             seq_output, _ = self.lstm(seq_output)  # (B, L, H)
 
-        # Attention으로 토큰 가중합
-        pooled = self.att(seq_output)  # (B, H)
+        # Attention pooling
+        pooled = self.att(seq_output, mask=attention_mask)  # (B, H)
 
         # 512차원으로 투영
-        out = self.fc(pooled)          # (B, 512)
-
+        out = self.fc(pooled)          # (B, out_dim)
         return out

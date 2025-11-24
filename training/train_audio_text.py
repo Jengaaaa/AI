@@ -15,15 +15,27 @@ def rmse_loss(pred, target):
     return torch.sqrt(nn.functional.mse_loss(pred, target))
 
 
-def get_dataloader(split_file, tokenizer_name, batch_size=2, num_segments=50, max_text_len=64, shuffle=True):
+def get_dataloader(split_file, tokenizer_name,
+                   batch_size=2, num_segments=50, max_text_len=64,
+                   shuffle=True, num_workers=0):
+    """
+    ⚠ Windows에서 num_workers>0 사용하면 librosa 호환 문제로 crash 발생 가능
+    → default=0 로 설정
+    """
+
     dataset = AVEC2017AudioTextDataset(
         root="data/avec2017/processed",
         split_file=split_file,
         tokenizer_name=tokenizer_name,
         num_segments=num_segments,
-        max_text_len=max_text_len,
+        max_text_len=max_text_len
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4)
+
+    loader = DataLoader(dataset,
+                        batch_size=batch_size,
+                        shuffle=shuffle,
+                        num_workers=num_workers,
+                        pin_memory=True)
     return loader
 
 
@@ -32,13 +44,13 @@ def train_one_epoch(model, loader, optimizer, device):
     total_loss = 0.0
 
     for batch in loader:
-        audio = batch["audio"].to(device)      # (B, S, L_a)
-        text = batch["text"].to(device)        # (B, S, L_t)
-        label = batch["label"].to(device)      # (B,)
+        audio = batch["audio"].to(device)  # (B, S, L_a)
+        text = batch["text"].to(device)    # (B, S, L_t)
+        label = batch["label"].to(device)  # (B,)
 
         optimizer.zero_grad()
 
-        pred = model(audio, text)              # (B,)
+        pred = model(audio, text)          # (B,)
         loss = rmse_loss(pred, label)
 
         loss.backward()
@@ -61,6 +73,7 @@ def eval_one_epoch(model, loader, device):
 
         pred = model(audio, text)
         loss = rmse_loss(pred, label)
+
         total_loss += loss.item() * audio.size(0)
 
     return total_loss / len(loader.dataset)
@@ -80,11 +93,18 @@ def main():
     train_split = "data/avec2017/raw/train_split.csv"
     dev_split = "data/avec2017/raw/dev_split.csv"
 
-    train_loader = get_dataloader(train_split, tokenizer_name, batch_size, num_segments, max_text_len, shuffle=True)
-    dev_loader = get_dataloader(dev_split, tokenizer_name, batch_size, num_segments, max_text_len, shuffle=False)
+    # dataloader
+    train_loader = get_dataloader(train_split, tokenizer_name,
+                                  batch_size, num_segments, max_text_len,
+                                  shuffle=True, num_workers=0)   # WINDOWS: 0
+    dev_loader = get_dataloader(dev_split, tokenizer_name,
+                                batch_size, num_segments, max_text_len,
+                                shuffle=False, num_workers=0)
 
-    audio_encoder = AudioEncoder()
+    # model 준비
+    audio_encoder = AudioEncoder(feat_dim=512)
     text_encoder = TextEncoder(model_name=tokenizer_name, out_dim=512, use_lstm=True)
+
     model = AudioTextDepressionModel(
         num_segments=num_segments,
         audio_encoder=audio_encoder,
@@ -94,21 +114,25 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_dev = 1e9
+    # checkpoint 경로 준비
     save_dir = "checkpoints/audio_text"
     os.makedirs(save_dir, exist_ok=True)
 
+    best_dev = 99999
+
+    # 학습 루프
     for epoch in range(1, num_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         dev_loss = eval_one_epoch(model, dev_loader, device)
 
-        print(f"[Epoch {epoch:02d}] Train RMSE: {train_loss:.4f}  |  Dev RMSE: {dev_loss:.4f}")
+        print(f"[Epoch {epoch:02d}] Train RMSE: {train_loss:.4f} | Dev RMSE: {dev_loss:.4f}")
 
+        # Best 모델 저장
         if dev_loss < best_dev:
             best_dev = dev_loss
-            ckpt_path = os.path.join(save_dir, f"best_model_epoch{epoch:02d}.pth")
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"[INFO] Best model 업데이트! 저장 경로: {ckpt_path}")
+            ckpt = os.path.join(save_dir, f"best_model_epoch{epoch:02d}.pth")
+            torch.save(model.state_dict(), ckpt)
+            print(f"[INFO] Best model updated → {ckpt}")
 
 
 if __name__ == "__main__":

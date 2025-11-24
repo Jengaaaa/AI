@@ -4,8 +4,9 @@ import librosa
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
+
 class AVEC2017AudioTextDataset(Dataset):
-    def __init__(self, 
+    def __init__(self,
                  root="data/avec2017/processed",
                  split_file="data/avec2017/raw/train_split.csv",
                  tokenizer_name="klue/bert-base",
@@ -16,20 +17,31 @@ class AVEC2017AudioTextDataset(Dataset):
         self.num_segments = num_segments
         self.max_text_len = max_text_len
 
-        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-        # Load split list
         self.data = []
         with open(split_file, "r") as f:
             lines = f.readlines()[1:]  # skip header
 
         for line in lines:
-            subject, label = line.strip().split(",")
+            parts = line.strip().split(",")
 
-            # subject = '300' -> '300_P'
+            # train/dev: Participant_ID, PHQ8_Binary, PHQ8_Score, ...
+            if len(parts) >= 3:
+                subject = parts[0]
+                label = parts[2]  # PHQ8_Score 사용
+            else:
+                # test_split.csv → label 없음
+                subject = parts[0]
+                label = None
+
+            # '303' → '303_P'
             if not subject.endswith("_P"):
                 subject = subject + "_P"
+
+            # label이 없는 test split은 스킵
+            if label is None or label == "":
+                continue
 
             self.data.append((subject, float(label)))
 
@@ -45,10 +57,10 @@ class AVEC2017AudioTextDataset(Dataset):
             audio, sr = librosa.load(seg_path, sr=16000)
             audio_tensors.append(torch.tensor(audio, dtype=torch.float32))
 
-        max_len = max([a.shape[0] for a in audio_tensors])
+        max_len = max([a.size(0) for a in audio_tensors])
         padded = [torch.nn.functional.pad(a, (0, max_len - len(a))) for a in audio_tensors]
 
-        return torch.stack(padded)   # (S, audio_len)
+        return torch.stack(padded)
 
     def load_text_segments(self, subject_id):
         seg_dir = f"{self.root}/segments_text/{subject_id}"
@@ -70,7 +82,6 @@ class AVEC2017AudioTextDataset(Dataset):
                 max_length=self.max_text_len,
                 return_tensors="pt"
             )
-
             text_tensors.append(encoded["input_ids"].squeeze(0))
 
         return torch.stack(text_tensors)
